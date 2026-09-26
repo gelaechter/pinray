@@ -12,7 +12,11 @@
 mod format;
 mod worker;
 
-use std::{sync::mpsc, thread, time::Duration};
+use std::{
+    sync::{Arc, mpsc},
+    thread,
+    time::Duration,
+};
 
 use pinray_core::{
     AudioBackend, BackendBundle, BackendInfo, BackendKind, CaptureEvent, CursorMode, PinrayError,
@@ -82,6 +86,9 @@ struct WaylandVideoBackend {
     control_tx: mpsc::Sender<ControlMessage>,
     event_rx: mpsc::Receiver<CaptureEvent>,
     worker: Option<thread::JoinHandle<Result<()>>>,
+    portal: Arc<PortalClient>,
+    session_handle: zbus::zvariant::OwnedObjectPath,
+    watcher: Option<thread::JoinHandle<()>>,
 }
 
 impl WaylandVideoBackend {
@@ -90,12 +97,12 @@ impl WaylandVideoBackend {
     /// Opens a portal session, obtains the PipeWire fd, and spawns a worker
     /// thread that runs the PipeWire main loop and frame capture.
     fn new(config: SessionConfig) -> Result<Self> {
-        let portal = PortalClient::new()?;
+        let portal = Arc::new(PortalClient::new()?);
         let cast = portal.start_screen_cast(
             matches!(config.cursor_mode, CursorMode::Embedded),
             config.restore_token.as_deref(),
         )?;
-        let (fd, streams, restore_token) = cast.into_parts();
+        let (fd, session_handle, streams, restore_token) = cast.into_parts();
         let stream = streams
             .into_iter()
             .next()
@@ -117,18 +124,41 @@ impl WaylandVideoBackend {
         // CRITICAL: The portal (D-Bus connection) must stay alive while PipeWire
         // uses the fd obtained from it. Dropping the PortalClient closes the D-Bus
         // socket, which invalidates the fd and causes "no more input formats" errors.
-        let worker = thread::spawn(move || {
-            let _portal_keepalive = portal;
-            worker::run_video_loop(
-                fd,
-                stream.node_id,
-                stream_size,
-                desired_format,
-                frame_rate,
-                control_rx,
-                event_tx,
-            )
-        });
+        let worker = {
+            let portal = portal.clone();
+            let event_tx = event_tx.clone();
+            thread::spawn(move || {
+                let _portal_keepalive = portal;
+                worker::run_video_loop(
+                    fd,
+                    stream.node_id,
+                    stream_size,
+                    desired_format,
+                    frame_rate,
+                    control_rx,
+                    event_tx,
+                )
+            })
+        };
+
+        let watcher = {
+            let portal = portal.clone();
+            let control_tx = control_tx.clone();
+            let watch_event_tx = event_tx.clone();
+            let handle = session_handle.clone();
+            thread::spawn(move || {
+                if let Err(e) = portal.wait_closed(&handle) {
+                    tracing::warn!("portal closed-watch failed: {e}");
+                    return;
+                }
+                tracing::info!("portal session closed by desktop environment");
+                // End must be queued BEFORE terminating the worker: the worker
+                // owns an event_tx clone, and its exit is what would surface as
+                // "channel disconnected" instead of a clean End.
+                let _ = watch_event_tx.send(CaptureEvent::End);
+                let _ = control_tx.send(ControlMessage::Terminate);
+            })
+        };
 
         Ok(Self {
             info: BackendInfo {
@@ -138,9 +168,12 @@ impl WaylandVideoBackend {
                 notes: "Wayland video via XDG Desktop Portal + PipeWire",
             },
             restore_token,
+            portal,
+            session_handle,
             control_tx,
             event_rx,
             worker: Some(worker),
+            watcher: Some(watcher),
         })
     }
 }
@@ -188,8 +221,13 @@ impl VideoBackend for WaylandVideoBackend {
 impl Drop for WaylandVideoBackend {
     fn drop(&mut self) {
         let _ = self.control_tx.send(ControlMessage::Terminate);
+        // Closing the session emits `Closed`, which unblocks the watcher.
+        let _ = self.portal.close_session(&self.session_handle);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(watcher) = self.watcher.take() {
+            let _ = watcher.join();
         }
     }
 }

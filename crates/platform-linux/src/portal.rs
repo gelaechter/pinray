@@ -43,14 +43,21 @@ pub struct ScreenCastStream {
 #[derive(Debug)]
 pub struct ActiveScreenCast {
     fd: OwnedFd,
+    session: OwnedObjectPath,
     pub streams: Vec<ScreenCastStream>,
     pub restore_token: Option<String>,
 }
 
 impl ActiveScreenCast {
-    /// Consume the session and return the raw parts: PipeWire fd, streams, restore token.
-    pub fn into_parts(self) -> (OwnedFd, Vec<ScreenCastStream>, Option<String>) {
-        (self.fd, self.streams, self.restore_token)
+    pub fn into_parts(
+        self,
+    ) -> (
+        OwnedFd,
+        OwnedObjectPath,
+        Vec<ScreenCastStream>,
+        Option<String>,
+    ) {
+        (self.fd, self.session, self.streams, self.restore_token)
     }
 }
 
@@ -68,6 +75,7 @@ impl ActiveScreenCast {
 /// let (fd, streams, _) = cast.into_parts();
 /// // portal MUST outlive the worker thread that uses `fd`
 /// ```
+#[derive(Clone)]
 pub struct PortalClient {
     connection: Connection,
 }
@@ -131,6 +139,7 @@ impl PortalClient {
                 })
                 .collect(),
             restore_token: response.restore_token,
+            session,
         })
     }
 
@@ -271,6 +280,39 @@ impl PortalClient {
             "org.freedesktop.portal.Request",
         )
         .map_err(|error| PinrayError::Platform(error.to_string()))
+    }
+
+    fn session_proxy<'a>(&self, session: &'a OwnedObjectPath) -> Result<Proxy<'a>> {
+        Proxy::new(
+            &self.connection,
+            "org.freedesktop.portal.Desktop",
+            session,
+            "org.freedesktop.portal.Session",
+        )
+        .map_err(|error| PinrayError::Platform(error.to_string()))
+    }
+
+    /// Blocks until the portal session ends: the DE/user cancels screen sharing,
+    /// the portal service goes away, or `close_session` is called. A dead D-Bus
+    /// connection also counts — dropping the connection invalidates the PipeWire
+    /// fd anyway, so the session is dead in practice.
+    pub fn wait_closed(&self, session: &OwnedObjectPath) -> Result<()> {
+        let proxy = self.session_proxy(session)?;
+        let mut signal = proxy
+            .receive_signal("Closed")
+            .map_err(|error| PinrayError::Platform(error.to_string()))?;
+        match signal.next() {
+            Some(_) => Ok(()),
+            None => Ok(()), // connection gone => session gone
+        }
+    }
+
+    /// Explicitly close the session. Per spec this makes the portal emit `Closed`.
+    pub fn close_session(&self, session: &OwnedObjectPath) -> Result<()> {
+        self.session_proxy(session)?
+            .call_method("Close", &())
+            .map_err(|error| PinrayError::Platform(error.to_string()))?;
+        Ok(())
     }
 }
 
